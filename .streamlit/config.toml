@@ -1,2 +1,13 @@
 [server]
 fileWatcherType = "none"
+
+[theme]
+base = "dark"
+primaryColor = "#38BDF8"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#111622"
+textColor = "#E2E8F0"
+borderColor = "#1E293B"
+codeBackgroundColor = "#1E293B"
+codeTextColor = "#38BDF8"
+baseRadius = "large"

@@ -1,0 +1,38 @@
+[project]
+name = "cold-chain-logistics-fde-project"
+version = "0.1.0"
+requires-python = ">=3.12.13"
+dependencies = [
+    "altair==6.2.2",
+    "faiss-cpu==1.15.0",
+    "langchain-community==0.4.2",
+    "langchain-huggingface==1.2.2",
+    "langchain-ollama>=1.1.0",
+    "langchain-openai==1.6.0",
+    "langchain-pinecone==0.2.13",
+    "langgraph==1.2.11",
+    "langgraph-checkpoint==4.2.0",
+    "langsmith==0.11.1",
+    "openai==3.3.1",
+    "openpyxl==3.1.5",
+    "pandas==3.0.5",
+    "pinecone==7.3.0",
+    "pydantic-settings==2.15.0",
+    "pyodbc==5.3.0",
+    "pypdf==6.16.2",
+    "python-dotenv==1.2.3",
+    "scikit-learn==1.9.0",
+    "sentence-transformers==6.0.0",
+    "sqlalchemy==2.0.52",
+    "streamlit==1.62.0",
+    "torch==2.13.0",
+]
+
+[dependency-groups]
+dev = [
+    "pandas-stubs>=3.0.5.260914",
+]
+
+[tool.pyright]
+# langgraph.graph ships without a py.typed marker, so this rule would flag every import of it.
+reportMissingTypeStubs = false

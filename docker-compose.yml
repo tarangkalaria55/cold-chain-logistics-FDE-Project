@@ -1,0 +1,10 @@
+services:
+  legacy-mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: legacy-mssql
+    ports:
+      - "${SQL_SERVER_PORT:-1433}:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${SQL_ADMIN_PASSWORD}"
+    restart: unless-stopped

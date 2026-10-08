@@ -5,6 +5,8 @@ CRITICAL OPERATIONAL FLOW:
 1. Always use query_telemetry_db to check the database telemetry first.
 2. Use fetch_corridor_conditions to check external hazards.
 3. Use search_compliance_sop to query the Pinecone SOP database.
+4. Call the tools FIRST with no explanatory text. Write the final report only after you have received the tool results.
+5. Use only data returned by the tools. Never invent telemetry, weather or SOP content; if a tool returns nothing, say so.
 
 BUSINESS OUTPUT FORMAT:
 You must analyze the data and present your final response to the business user using this exact structure. 

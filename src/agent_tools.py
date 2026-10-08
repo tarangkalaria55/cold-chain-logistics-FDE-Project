@@ -1,10 +1,12 @@
-import os
-import urllib
+import re
+import sys
+import time
 import requests
 from pathlib import Path
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from typing import Any
+from sqlalchemy import Engine, text
 
+from langchain_core.embeddings import Embeddings
 from langchain_core.tools import tool
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
@@ -13,14 +15,16 @@ from langchain_pinecone import PineconeVectorStore
 # 1. ENVIRONMENT & DYNAMIC INDEX ATTACHMENT
 # ==========================================
 script_dir = Path(__file__).resolve().parent
-project_root = script_dir.parent  
+project_root = script_dir.parent
 
-load_dotenv(dotenv_path=project_root / ".env")
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+from src.config import EmbeddingsModel, reveal, settings
+from src.db import make_engine
 
 
-def get_cached_huggingface_embeddings(model_name: str):
+def get_cached_huggingface_embeddings(model_name: str) -> Embeddings:
     """
     Loads and locks the HuggingFace model weights into the machine's global RAM.
     If called again during any subsequent script rerun, it returns instantly.
@@ -29,7 +33,7 @@ def get_cached_huggingface_embeddings(model_name: str):
     
     # We wrap the inner call with st.cache_resource dynamically 
     @st.cache_resource(show_spinner=False)
-    def _load_model(name: str):
+    def _load_model(name: str) -> Embeddings:
         print(f"🧠 MEMORY SEED: Permanently caching local model [{name}] in global RAM...")
         from langchain_huggingface import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(
@@ -38,28 +42,24 @@ def get_cached_huggingface_embeddings(model_name: str):
         )
     return _load_model(model_name)
 
-EMBEDDINGS_MODEL_SETTING = os.getenv("Embeddings_model", "LOCAL").strip().upper()
+EMBEDDINGS_MODEL_SETTING = settings.embeddings_model
 
-db_host = os.getenv("SQL_SERVER_HOST", "localhost")
-db_port = os.getenv("SQL_SERVER_PORT", "1433")
-db_user = os.getenv("SQL_AGENT_USER", "USR_FDE_RO")
-db_password = os.getenv("SQL_AGENT_PASSWORD")
+db_user = settings.sql_agent_user
+db_password = reveal(settings.sql_agent_password)
 
-if not PINECONE_API_KEY:
-    raise ValueError("CRITICAL: Ensure PINECONE_API_KEY is present in your active .env profile.")
+INDEX_NAME = "fde-sop-index-openai" if EMBEDDINGS_MODEL_SETTING is EmbeddingsModel.OPENAI else "fde-sop-index-local"
 
-if EMBEDDINGS_MODEL_SETTING == "OPENAI":
+if EMBEDDINGS_MODEL_SETTING is EmbeddingsModel.OPENAI:
     print("🤖 Mode: Connecting to Cloud OpenAI Index (1536 Dim Space)...")
     embeddings = OpenAIEmbeddings()
-    INDEX_NAME = "fde-sop-index-openai"
 else :
-    local_model_target = os.getenv("Local_Embedding_Model", "BAAI/bge-m3").strip()
+    local_model_target = settings.local_embedding_model
     
     print(f"🤗 Mode: Connecting to Local Fallback [{local_model_target}] Index (1024 Dim Space)...")
 
     try:
-        import streamlit as st
-        if st.runtime.exists():
+        from streamlit.runtime import exists as streamlit_runtime_exists
+        if streamlit_runtime_exists():
             embeddings = get_cached_huggingface_embeddings(local_model_target)
         else:
             from langchain_huggingface import HuggingFaceEmbeddings
@@ -68,14 +68,52 @@ else :
         from langchain_huggingface import HuggingFaceEmbeddings
         embeddings = HuggingFaceEmbeddings(model_name=local_model_target, model_kwargs={'device': 'cpu'})
 
-    INDEX_NAME = "fde-sop-index-local"
-
 vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
 retriever = vector_store.as_retriever(search_kwargs={"k": 2})
 
 # ==========================================
 # 2. CORE FDE AGENT TOOLS
 # ==========================================
+
+# Keep tool output small: it is re-read by a (slow) LLM on every following step.
+MAX_TOOL_OUTPUT_CHARS = 4000
+MAX_QUERY_ROWS = 10
+
+_telemetry_engine: Engine | None = None
+
+
+def get_telemetry_engine() -> Engine:
+    """Build the read-only engine once and reuse its connection pool across tool calls."""
+    global _telemetry_engine
+    if _telemetry_engine is None:
+        _telemetry_engine = make_engine(db_user, db_password)
+    return _telemetry_engine
+
+
+# Defence in depth on top of the read-only DB login: a single plain SELECT only.
+_FORBIDDEN_SQL = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|MERGE|EXEC|EXECUTE|GRANT|REVOKE|INTO|OPENROWSET|OPENQUERY|XP_\w+|SP_\w+)\b",
+    re.IGNORECASE,
+)
+
+
+def validate_select_only(sql_query: str) -> str | None:
+    """Return an error message if the query isn't a single plain SELECT, else None."""
+    stripped = sql_query.strip().rstrip(";").strip()
+    if not stripped.upper().startswith("SELECT"):
+        return "SECURITY BLOCK: Only SELECT operations are authorized on this view."
+    if ";" in stripped or "--" in stripped or "/*" in stripped:
+        return "SECURITY BLOCK: Multiple statements and SQL comments are not allowed."
+    if _FORBIDDEN_SQL.search(stripped):
+        return "SECURITY BLOCK: Query contains a forbidden keyword."
+    return None
+
+
+def _truncate(text_value: str) -> str:
+    if len(text_value) <= MAX_TOOL_OUTPUT_CHARS:
+        return text_value
+    return text_value[:MAX_TOOL_OUTPUT_CHARS] + "\n...[output truncated]"
+
 
 @tool
 def query_telemetry_db(sql_query: str) -> str:
@@ -86,39 +124,30 @@ def query_telemetry_db(sql_query: str) -> str:
     Risk_Classification, Delay_Probability, Port_Congestion_Level, Route_Risk_Index.
     Always write standard T-SQL queries.
     """
-    connection_string = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-            f"SERVER={db_host},{db_port};"
-            f"DATABASE=master;"
-            f"UID={db_user};"
-            f"PWD={db_password};"
-            f"Encrypt=no;"
-            f"TrustServerCertificate=yes;"
-        )
+    blocked = validate_select_only(sql_query)
+    if blocked:
+        return blocked
 
-    params = urllib.parse.quote_plus(connection_string)
-    
-    engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
-    
     try:
-        if not sql_query.strip().upper().startswith("SELECT"):
-            return "SECURITY BLOCK: Only SELECT operations are authorized on this view."
-            
-        with engine.connect() as conn:
+        with get_telemetry_engine().connect() as conn:
             cursor = conn.execute(text(sql_query))
             columns = list(cursor.keys())
-            rows = cursor.fetchmany(10)
-            
+            rows = cursor.fetchmany(MAX_QUERY_ROWS)
+
             if not rows:
                 return "No records matched the query criteria."
-                
-            formatted_output = f"COLUMNS: {', '.join(columns)}\n"
-            for row in rows:
-                formatted_output += str(tuple(row)) + "\n"
-                
-            return formatted_output
+
+            lines = [f"COLUMNS: {', '.join(columns)}"]
+            lines.extend(str(tuple(row)) for row in rows)
+            return _truncate("\n".join(lines) + "\n")
     except Exception as e:
         return f"Database Error: {str(e)}"
+
+
+_http = requests.Session()
+_CORRIDOR_TTL_SECONDS = 600
+_corridor_cache: dict[tuple[float, float], tuple[float, str]] = {}
+
 
 @tool
 def fetch_corridor_conditions(latitude: float, longitude: float) -> str:
@@ -126,25 +155,41 @@ def fetch_corridor_conditions(latitude: float, longitude: float) -> str:
     Fetches real-time weather and corridor conditions from a live REST API for given GPS coordinates.
     Provides temperature, wind speed, and computed corridor congestion index.
     """
+    if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0):
+        return "Invalid coordinates: latitude must be within -90..90 and longitude within -180..180."
+
+    # Weather barely changes in minutes; reuse a recent answer for the same ~1 km cell.
+    cache_key = (round(latitude, 2), round(longitude, 2))
+    cached = _corridor_cache.get(cache_key)
+    if cached is not None and time.monotonic() - cached[0] < _CORRIDOR_TTL_SECONDS:
+        return cached[1]
+
     try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current_weather=true"
-        response = requests.get(url, timeout=6)
+        response = _http.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": latitude, "longitude": longitude, "current_weather": "true"},
+            timeout=6,
+        )
         response.raise_for_status()
-        
-        payload = response.json().get("current_weather", {})
+
+        payload: dict[str, Any] = response.json().get("current_weather", {})
         temp = payload.get("temperature", "N/A")
         wind = payload.get("windspeed", 0.0)
-        
+
         congestion_index = 8.5 if wind > 10.0 else 2.5
         status_note = "High Transit Disruption" if wind > 10.0 else "Corridor Normal"
-        
-        return (
+
+        result = (
             f"--- LIVE CORRIDOR TELEMETRY ---\n"
             f"Target GPS: {latitude}, {longitude}\n"
             f"External Temp: {temp}°C | Wind Speed: {wind} km/h\n"
             f"Corridor Risk: {status_note} (Congestion Index: {congestion_index}/10)\n"
             f"-------------------------------"
         )
+        if len(_corridor_cache) >= 256:  # bound memory
+            _corridor_cache.clear()
+        _corridor_cache[cache_key] = (time.monotonic(), result)
+        return result
     except Exception as e:
         return f"Corridor API Communication Failure: {str(e)}"
 
